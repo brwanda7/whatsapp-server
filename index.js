@@ -329,6 +329,20 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => console.log('[Socket] Disconnected:', socket.id));
 });
 
+app.get('/test-php', async (req, res) => {
+  try {
+    const response = await fetch(`${process.env.PHP_API_URL}/v1/whatsapp/session-load`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.PHP_API_KEY}` },
+      body: JSON.stringify({ session_id: 'test' })
+    });
+    const text = await response.text();
+    res.json({ ok: true, status: response.status, body: text });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ── Boot ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
