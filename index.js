@@ -1,16 +1,17 @@
 require('dotenv').config();
-const express    = require('express');
-const http       = require('http');
-const { Server } = require('socket.io');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcode     = require('qrcode');
-const cors       = require('cors');
+const express          = require('express');
+const http             = require('http');
+const { Server }       = require('socket.io');
+const { Client, RemoteAuth, MessageMedia } = require('whatsapp-web.js');
+const qrcode           = require('qrcode');
+const cors             = require('cors');
+const PhpSessionStore  = require('./PhpSessionStore');
 
 const app    = express();
 const server = http.createServer(app);
 const io     = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
-  pingTimeout: 60000,
+  pingTimeout:  60000,
   pingInterval: 25000,
 });
 
@@ -18,18 +19,37 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 // ── State ──────────────────────────────────────────────────────────────────
-let qrCodeData    = null;
-let isReady       = false;
+let client         = null;
+let qrCodeData     = null;
+let isReady        = false;
 let isInitializing = false;
 
-// ── WhatsApp Client ────────────────────────────────────────────────────────
-// On Render: mount a persistent disk at /data and set dataPath there
-// On Render free tier: use /tmp (will reset on restart but at least won't crash)
-const SESSION_PATH = process.env.SESSION_PATH || './wa_session';
+// ── PHP Store ──────────────────────────────────────────────────────────────
+const store = new PhpSessionStore(
+  process.env.PHP_API_URL,
+  process.env.PHP_API_KEY,
+);
 
-function createClient() {
-  return new Client({
-    authStrategy: new LocalAuth({ dataPath: SESSION_PATH, clientId: 'main' }),
+// ── Init client ────────────────────────────────────────────────────────────
+async function initClient() {
+  if (isInitializing) return;
+  isInitializing = true;
+  qrCodeData     = null;
+  isReady        = false;
+
+  if (client) {
+    try { await client.destroy(); } catch (_) {}
+    client = null;
+  }
+
+  io.emit('loading', { percent: 0, message: 'Starting WhatsApp...' });
+
+  client = new Client({
+    authStrategy: new RemoteAuth({
+      clientId:             'main',
+      store,
+      backupSyncIntervalMs: 60000 * 5, // save every 5 min
+    }),
     puppeteer: {
       headless: true,
       args: [
@@ -37,150 +57,157 @@ function createClient() {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
         '--no-first-run',
         '--no-zygote',
-        '--disable-gpu',
-        '--single-process',         // important for Render
+        '--single-process',
+        '--disable-extensions',
       ],
     },
-    restartOnAuthFail: true,        // auto-restart if auth fails instead of logout loop
+    restartOnAuthFail: false,
   });
+
+  // ── QR ───────────────────────────────────────────────────────────────────
+  client.on('qr', async (qr) => {
+    console.log('New QR code generated');
+    qrCodeData     = await qrcode.toDataURL(qr);
+    isReady        = false;
+    isInitializing = false;
+    io.emit('qr', qrCodeData);
+  });
+
+  // ── Loading ───────────────────────────────────────────────────────────────
+  client.on('loading_screen', (percent, message) => {
+    console.log(`Loading ${percent}% — ${message}`);
+    io.emit('loading', { percent, message });
+  });
+
+  // ── Authenticated ─────────────────────────────────────────────────────────
+  client.on('authenticated', () => {
+    console.log('Authenticated ✓');
+    qrCodeData = null;
+    io.emit('authenticated');
+  });
+
+  // ── Remote session saved ──────────────────────────────────────────────────
+  client.on('remote_session_saved', () => {
+    console.log('Session saved to PHP DB ✓');
+  });
+
+  // ── Auth failure ──────────────────────────────────────────────────────────
+  client.on('auth_failure', async (msg) => {
+    console.error('Auth failure:', msg);
+    isReady        = false;
+    isInitializing = false;
+    // Delete bad session from DB so fresh QR is shown
+    await store.delete({ session: 'main' });
+    io.emit('auth_failure', { message: msg });
+    setTimeout(() => initClient(), 3000);
+  });
+
+  // ── Ready ─────────────────────────────────────────────────────────────────
+  client.on('ready', () => {
+    isReady        = true;
+    isInitializing = false;
+    qrCodeData     = null;
+    const info     = client.info;
+    console.log('WhatsApp Ready ✓ —', info?.wid?.user);
+    io.emit('ready', {
+      phone: info?.wid?.user,
+      name:  info?.pushname,
+    });
+  });
+
+  // ── Disconnected ──────────────────────────────────────────────────────────
+  client.on('disconnected', async (reason) => {
+    console.log('Disconnected:', reason);
+    isReady = false;
+    io.emit('disconnected', { reason });
+
+    if (reason === 'LOGOUT') {
+      // User manually logged out — delete session from DB
+      await store.delete({ session: 'main' });
+    } else {
+      // Unexpected disconnect — try reconnect after 5s
+      console.log('Reconnecting in 5s...');
+      setTimeout(() => initClient(), 5000);
+    }
+  });
+
+  // ── Incoming message ──────────────────────────────────────────────────────
+  client.on('message', async (msg) => {
+    try {
+      const contact = await msg.getContact();
+      const chat    = await msg.getChat();
+      const payload = {
+        id:          msg.id._serialized,
+        from:        msg.from,
+        to:          msg.to,
+        body:        msg.body,
+        type:        msg.type,
+        timestamp:   msg.timestamp,
+        isGroup:     msg.from.includes('@g.us'),
+        fromMe:      msg.fromMe,
+        contactName: contact.pushname || contact.number,
+        chatName:    chat.name,
+        hasMedia:    msg.hasMedia,
+      };
+      io.emit('message', payload);
+      // Save to PHP
+      if (process.env.PHP_API_URL) {
+        fetch(`${process.env.PHP_API_URL}/v1/whatsapp/save-message`, {
+          method:  'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization:  `Bearer ${process.env.PHP_API_KEY}`,
+          },
+          body: JSON.stringify(payload),
+        }).catch(e => console.error('Save msg error:', e.message));
+      }
+    } catch (err) {
+      console.error('Message event error:', err.message);
+    }
+  });
+
+  // ── Message ACK ───────────────────────────────────────────────────────────
+  client.on('message_ack', (msg, ack) => {
+    io.emit('message_ack', { id: msg.id._serialized, ack });
+  });
+
+  // ── Initialize ────────────────────────────────────────────────────────────
+  try {
+    await client.initialize();
+  } catch (err) {
+    console.error('Initialize error:', err.message);
+    isInitializing = false;
+    setTimeout(() => initClient(), 5000);
+  }
 }
 
-let client = createClient();
-
-// ── QR ─────────────────────────────────────────────────────────────────────
-client.on('qr', async (qr) => {
-  console.log('QR received');
-  qrCodeData = await qrcode.toDataURL(qr);
-  isReady    = false;
-  io.emit('qr', qrCodeData);
-});
-
-// ── Loading screen ─────────────────────────────────────────────────────────
-client.on('loading_screen', (percent, message) => {
-  console.log(`Loading: ${percent}% — ${message}`);
-  io.emit('loading', { percent, message });
-});
-
-// ── Authenticated ──────────────────────────────────────────────────────────
-client.on('authenticated', () => {
-  console.log('Authenticated ✓');
-  qrCodeData = null;
-  io.emit('authenticated');
-});
-
-// ── Auth failure ───────────────────────────────────────────────────────────
-client.on('auth_failure', (msg) => {
-  console.error('Auth failure:', msg);
-  isReady = false;
-  io.emit('auth_failure', { message: msg });
-});
-
-// ── Ready ──────────────────────────────────────────────────────────────────
-client.on('ready', async () => {
-  isReady        = true;
-  isInitializing = false;
-  qrCodeData     = null;
-  const info     = client.info;
-  console.log('WhatsApp ready ✓', info?.wid?.user);
-  io.emit('ready', {
-    phone:  info?.wid?.user,
-    name:   info?.pushname,
-  });
-});
-
-// ── Disconnected ───────────────────────────────────────────────────────────
-client.on('disconnected', async (reason) => {
-  console.log('Disconnected:', reason);
-  isReady = false;
-  io.emit('disconnected', { reason });
-
-  // Only auto-reinitialize for non-manual logouts
-  if (reason !== 'LOGOUT') {
-    console.log('Attempting reconnect in 5s...');
-    setTimeout(() => {
-      if (!isReady && !isInitializing) {
-        isInitializing = true;
-        client.initialize().catch(console.error);
-      }
-    }, 5000);
-  }
-});
-
-// ── Incoming message ───────────────────────────────────────────────────────
-client.on('message', async (msg) => {
-  try {
-    const contact = await msg.getContact();
-    const chat    = await msg.getChat();
-
-    const payload = {
-      id:          msg.id._serialized,
-      from:        msg.from,
-      to:          msg.to,
-      body:        msg.body,
-      type:        msg.type,
-      timestamp:   msg.timestamp,
-      isGroup:     msg.from.includes('@g.us'),
-      fromMe:      msg.fromMe,
-      contactName: contact.pushname || contact.number,
-      chatName:    chat.name,
-      hasMedia:    msg.hasMedia,
-    };
-
-    io.emit('message', payload);
-
-    // Save to PHP API if configured
-    if (process.env.PHP_API_URL) {
-      fetch(`${process.env.PHP_API_URL}/v1/whatsapp/save-message`, {
-        method:  'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization:  `Bearer ${process.env.PHP_API_KEY}`,
-        },
-        body: JSON.stringify(payload),
-      }).catch(err => console.error('Save message failed:', err.message));
-    }
-  } catch (err) {
-    console.error('Message event error:', err.message);
-  }
-});
-
-// ── Message ACK ────────────────────────────────────────────────────────────
-client.on('message_ack', (msg, ack) => {
-  io.emit('message_ack', { id: msg.id._serialized, ack });
-});
-
-// ── Keep-alive ping (prevents Render free tier from sleeping) ──────────────
+// ── Keep-alive ping ────────────────────────────────────────────────────────
 setInterval(() => {
   if (process.env.RENDER_EXTERNAL_URL) {
-    fetch(`${process.env.RENDER_EXTERNAL_URL}/ping`)
-      .catch(() => {}); // silent fail
+    fetch(`${process.env.RENDER_EXTERNAL_URL}/ping`).catch(() => {});
   }
-}, 14 * 60 * 1000); // every 14 minutes
+}, 14 * 60 * 1000);
 
-// ────────────────────────────────────────────────────────────────────────────
-// REST API
-// ────────────────────────────────────────────────────────────────────────────
+// ── REST endpoints ─────────────────────────────────────────────────────────
 
-// Health / keep-alive
 app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// Status
 app.get('/status', (req, res) => {
   res.json({
     isReady,
     isInitializing,
     qrCode: qrCodeData,
-    phone:  isReady ? client.info?.wid?.user  : null,
-    name:   isReady ? client.info?.pushname   : null,
+    phone:  isReady ? client?.info?.wid?.user  : null,
+    name:   isReady ? client?.info?.pushname   : null,
   });
 });
 
-// Send text message
 app.post('/send', async (req, res) => {
   const { to, message } = req.body;
-  if (!isReady)   return res.status(503).json({ success: false, message: 'WhatsApp not connected' });
+  if (!isReady)        return res.status(503).json({ success: false, message: 'WhatsApp not connected' });
   if (!to || !message) return res.status(400).json({ success: false, message: 'Missing to or message' });
   try {
     const chatId = to.includes('@') ? to : `${to.replace(/\D/g, '')}@c.us`;
@@ -191,7 +218,6 @@ app.post('/send', async (req, res) => {
   }
 });
 
-// Send media
 app.post('/send-media', async (req, res) => {
   const { to, base64, mimetype, filename, caption } = req.body;
   if (!isReady) return res.status(503).json({ success: false, message: 'WhatsApp not connected' });
@@ -205,7 +231,6 @@ app.post('/send-media', async (req, res) => {
   }
 });
 
-// Get chats
 app.get('/chats', async (req, res) => {
   if (!isReady) return res.status(503).json({ success: false, message: 'WhatsApp not connected' });
   try {
@@ -228,7 +253,6 @@ app.get('/chats', async (req, res) => {
   }
 });
 
-// Get messages for a chat
 app.post('/messages', async (req, res) => {
   const { chatId, limit = 50 } = req.body;
   if (!isReady) return res.status(503).json({ success: false, message: 'WhatsApp not connected' });
@@ -254,7 +278,6 @@ app.post('/messages', async (req, res) => {
   }
 });
 
-// Mark chat as read
 app.post('/read', async (req, res) => {
   const { chatId } = req.body;
   if (!isReady) return res.status(503).json({ success: false, message: 'WhatsApp not connected' });
@@ -267,7 +290,6 @@ app.post('/read', async (req, res) => {
   }
 });
 
-// Logout
 app.post('/logout', async (req, res) => {
   try {
     await client.logout();
@@ -281,23 +303,19 @@ app.post('/logout', async (req, res) => {
 // ── Socket.io ──────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log('Socket connected:', socket.id);
-  // Immediately push current state
   socket.emit('init', {
     isReady,
     isInitializing,
     qrCode: qrCodeData,
-    phone:  isReady ? client.info?.wid?.user : null,
-    name:   isReady ? client.info?.pushname  : null,
+    phone:  isReady ? client?.info?.wid?.user : null,
+    name:   isReady ? client?.info?.pushname  : null,
   });
   socket.on('disconnect', () => console.log('Socket disconnected:', socket.id));
 });
 
 // ── Start ──────────────────────────────────────────────────────────────────
-isInitializing = true;
-client.initialize().catch(err => {
-  console.error('Init error:', err);
-  isInitializing = false;
-});
-
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`WA server on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`WA server on port ${PORT}`);
+  initClient();
+});
