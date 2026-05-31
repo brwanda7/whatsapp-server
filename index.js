@@ -1,51 +1,111 @@
-const express = require('express');
-const http = require('http');
+require('dotenv').config();
+const express    = require('express');
+const http       = require('http');
 const { Server } = require('socket.io');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcode = require('qrcode');
-const cors = require('cors');
+const qrcode     = require('qrcode');
+const cors       = require('cors');
 
-const app = express();
+const app    = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] }
+const io     = new Server(server, {
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+  pingTimeout: 60000,
+  pingInterval: 25000,
 });
 
-app.use(cors());
+app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
-let qrCodeData = null;
-let isReady = false;
+// ── State ──────────────────────────────────────────────────────────────────
+let qrCodeData    = null;
+let isReady       = false;
+let isInitializing = false;
 
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: './wa_session' }),
-  puppeteer: {
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-  }
+// ── WhatsApp Client ────────────────────────────────────────────────────────
+// On Render: mount a persistent disk at /data and set dataPath there
+// On Render free tier: use /tmp (will reset on restart but at least won't crash)
+const SESSION_PATH = process.env.SESSION_PATH || './wa_session';
+
+function createClient() {
+  return new Client({
+    authStrategy: new LocalAuth({ dataPath: SESSION_PATH, clientId: 'main' }),
+    puppeteer: {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--single-process',         // important for Render
+      ],
+    },
+    restartOnAuthFail: true,        // auto-restart if auth fails instead of logout loop
+  });
+}
+
+let client = createClient();
+
+// ── QR ─────────────────────────────────────────────────────────────────────
+client.on('qr', async (qr) => {
+  console.log('QR received');
+  qrCodeData = await qrcode.toDataURL(qr);
+  isReady    = false;
+  io.emit('qr', qrCodeData);
 });
 
-// ── QR Code ────────────────────────────────────────────────────────────────
-client.on('qr', async (qr) => {
-  qrCodeData = await qrcode.toDataURL(qr);
+// ── Loading screen ─────────────────────────────────────────────────────────
+client.on('loading_screen', (percent, message) => {
+  console.log(`Loading: ${percent}% — ${message}`);
+  io.emit('loading', { percent, message });
+});
+
+// ── Authenticated ──────────────────────────────────────────────────────────
+client.on('authenticated', () => {
+  console.log('Authenticated ✓');
+  qrCodeData = null;
+  io.emit('authenticated');
+});
+
+// ── Auth failure ───────────────────────────────────────────────────────────
+client.on('auth_failure', (msg) => {
+  console.error('Auth failure:', msg);
   isReady = false;
-  io.emit('qr', qrCodeData);
-  console.log('QR code generated');
+  io.emit('auth_failure', { message: msg });
 });
 
 // ── Ready ──────────────────────────────────────────────────────────────────
-client.on('ready', () => {
-  isReady = true;
-  qrCodeData = null;
-  io.emit('ready', { message: 'WhatsApp connected!' });
-  console.log('WhatsApp client ready');
+client.on('ready', async () => {
+  isReady        = true;
+  isInitializing = false;
+  qrCodeData     = null;
+  const info     = client.info;
+  console.log('WhatsApp ready ✓', info?.wid?.user);
+  io.emit('ready', {
+    phone:  info?.wid?.user,
+    name:   info?.pushname,
+  });
 });
 
 // ── Disconnected ───────────────────────────────────────────────────────────
-client.on('disconnected', (reason) => {
+client.on('disconnected', async (reason) => {
+  console.log('Disconnected:', reason);
   isReady = false;
   io.emit('disconnected', { reason });
-  console.log('WhatsApp disconnected:', reason);
+
+  // Only auto-reinitialize for non-manual logouts
+  if (reason !== 'LOGOUT') {
+    console.log('Attempting reconnect in 5s...');
+    setTimeout(() => {
+      if (!isReady && !isInitializing) {
+        isInitializing = true;
+        client.initialize().catch(console.error);
+      }
+    }, 5000);
+  }
 });
 
 // ── Incoming message ───────────────────────────────────────────────────────
@@ -68,41 +128,62 @@ client.on('message', async (msg) => {
       hasMedia:    msg.hasMedia,
     };
 
-    // Save to your PHP API
-    await fetch(`${process.env.PHP_API_URL}/v1/whatsapp/save-message`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.PHP_API_KEY}`,
-      },
-      body: JSON.stringify(payload),
-    }).catch(err => console.error('Failed to save message:', err));
-
     io.emit('message', payload);
+
+    // Save to PHP API if configured
+    if (process.env.PHP_API_URL) {
+      fetch(`${process.env.PHP_API_URL}/v1/whatsapp/save-message`, {
+        method:  'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization:  `Bearer ${process.env.PHP_API_KEY}`,
+        },
+        body: JSON.stringify(payload),
+      }).catch(err => console.error('Save message failed:', err.message));
+    }
   } catch (err) {
-    console.error('Message handling error:', err);
+    console.error('Message event error:', err.message);
   }
 });
 
-// ── Message ACK (sent/delivered/read) ─────────────────────────────────────
+// ── Message ACK ────────────────────────────────────────────────────────────
 client.on('message_ack', (msg, ack) => {
   io.emit('message_ack', { id: msg.id._serialized, ack });
 });
 
-// ── REST endpoints ─────────────────────────────────────────────────────────
+// ── Keep-alive ping (prevents Render free tier from sleeping) ──────────────
+setInterval(() => {
+  if (process.env.RENDER_EXTERNAL_URL) {
+    fetch(`${process.env.RENDER_EXTERNAL_URL}/ping`)
+      .catch(() => {}); // silent fail
+  }
+}, 14 * 60 * 1000); // every 14 minutes
+
+// ────────────────────────────────────────────────────────────────────────────
+// REST API
+// ────────────────────────────────────────────────────────────────────────────
+
+// Health / keep-alive
+app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 // Status
 app.get('/status', (req, res) => {
-  res.json({ isReady, qrCode: qrCodeData });
+  res.json({
+    isReady,
+    isInitializing,
+    qrCode: qrCodeData,
+    phone:  isReady ? client.info?.wid?.user  : null,
+    name:   isReady ? client.info?.pushname   : null,
+  });
 });
 
-// Send message
+// Send text message
 app.post('/send', async (req, res) => {
   const { to, message } = req.body;
-  if (!isReady) return res.status(503).json({ success: false, message: 'WhatsApp not connected' });
+  if (!isReady)   return res.status(503).json({ success: false, message: 'WhatsApp not connected' });
   if (!to || !message) return res.status(400).json({ success: false, message: 'Missing to or message' });
   try {
-    const chatId = to.includes('@c.us') ? to : `${to.replace(/\D/g, '')}@c.us`;
+    const chatId = to.includes('@') ? to : `${to.replace(/\D/g, '')}@c.us`;
     const sent   = await client.sendMessage(chatId, message);
     res.json({ success: true, id: sent.id._serialized });
   } catch (err) {
@@ -115,7 +196,7 @@ app.post('/send-media', async (req, res) => {
   const { to, base64, mimetype, filename, caption } = req.body;
   if (!isReady) return res.status(503).json({ success: false, message: 'WhatsApp not connected' });
   try {
-    const chatId = to.includes('@c.us') ? to : `${to.replace(/\D/g, '')}@c.us`;
+    const chatId = to.includes('@') ? to : `${to.replace(/\D/g, '')}@c.us`;
     const media  = new MessageMedia(mimetype, base64, filename);
     const sent   = await client.sendMessage(chatId, media, { caption });
     res.json({ success: true, id: sent.id._serialized });
@@ -124,20 +205,24 @@ app.post('/send-media', async (req, res) => {
   }
 });
 
-// Get all chats
+// Get chats
 app.get('/chats', async (req, res) => {
   if (!isReady) return res.status(503).json({ success: false, message: 'WhatsApp not connected' });
   try {
     const chats = await client.getChats();
-    const data  = chats.slice(0, 50).map(chat => ({
-      id:             chat.id._serialized,
-      name:           chat.name,
-      isGroup:        chat.isGroup,
-      unreadCount:    chat.unreadCount,
-      lastMessage:    chat.lastMessage?.body ?? '',
-      lastMessageTime: chat.lastMessage?.timestamp ?? 0,
-    }));
-    res.json({ success: true, chats: data });
+    res.json({
+      success: true,
+      chats: chats.slice(0, 100).map(c => ({
+        id:              c.id._serialized,
+        name:            c.name,
+        isGroup:         c.isGroup,
+        unreadCount:     c.unreadCount,
+        lastMessage:     c.lastMessage?.body ?? '',
+        lastMessageTime: c.lastMessage?.timestamp ?? 0,
+        pinned:          c.pinned,
+        archived:        c.archived,
+      })),
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -145,21 +230,38 @@ app.get('/chats', async (req, res) => {
 
 // Get messages for a chat
 app.post('/messages', async (req, res) => {
-  const { chatId, limit = 30 } = req.body;
+  const { chatId, limit = 50 } = req.body;
   if (!isReady) return res.status(503).json({ success: false, message: 'WhatsApp not connected' });
+  if (!chatId)  return res.status(400).json({ success: false, message: 'Missing chatId' });
   try {
     const chat     = await client.getChatById(chatId);
     const messages = await chat.fetchMessages({ limit });
-    const data     = messages.map(msg => ({
-      id:        msg.id._serialized,
-      body:      msg.body,
-      type:      msg.type,
-      fromMe:    msg.fromMe,
-      timestamp: msg.timestamp,
-      hasMedia:  msg.hasMedia,
-      ack:       msg.ack,
-    }));
-    res.json({ success: true, messages: data });
+    res.json({
+      success: true,
+      messages: messages.map(m => ({
+        id:        m.id._serialized,
+        body:      m.body,
+        type:      m.type,
+        fromMe:    m.fromMe,
+        timestamp: m.timestamp,
+        hasMedia:  m.hasMedia,
+        ack:       m.ack,
+        author:    m.author ?? null,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Mark chat as read
+app.post('/read', async (req, res) => {
+  const { chatId } = req.body;
+  if (!isReady) return res.status(503).json({ success: false, message: 'WhatsApp not connected' });
+  try {
+    const chat = await client.getChatById(chatId);
+    await chat.sendSeen();
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -169,6 +271,7 @@ app.post('/messages', async (req, res) => {
 app.post('/logout', async (req, res) => {
   try {
     await client.logout();
+    isReady = false;
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -177,14 +280,24 @@ app.post('/logout', async (req, res) => {
 
 // ── Socket.io ──────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
-  // Send current state to newly connected client
-  if (qrCodeData) socket.emit('qr', qrCodeData);
-  if (isReady)    socket.emit('ready', { message: 'WhatsApp connected!' });
-  socket.on('disconnect', () => console.log('Client disconnected:', socket.id));
+  console.log('Socket connected:', socket.id);
+  // Immediately push current state
+  socket.emit('init', {
+    isReady,
+    isInitializing,
+    qrCode: qrCodeData,
+    phone:  isReady ? client.info?.wid?.user : null,
+    name:   isReady ? client.info?.pushname  : null,
+  });
+  socket.on('disconnect', () => console.log('Socket disconnected:', socket.id));
 });
 
-client.initialize();
+// ── Start ──────────────────────────────────────────────────────────────────
+isInitializing = true;
+client.initialize().catch(err => {
+  console.error('Init error:', err);
+  isInitializing = false;
+});
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`WhatsApp server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`WA server on port ${PORT}`));
