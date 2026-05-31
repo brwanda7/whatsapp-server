@@ -28,26 +28,22 @@ class PhpSessionStore {
   }
 
   async save({ session, data }) {
-    try {
-      // data is a zip file Buffer — convert to base64
-      const base64 = Buffer.isBuffer(data)
-        ? data.toString('base64')
-        : Buffer.from(data).toString('base64');
-
-      const res = await fetch(`${this.apiUrl}/v1/whatsapp/session-save`, {
-        method:  'POST',
-        headers: this.headers,
-        body:    JSON.stringify({
-          session_id:   session,
-          session_data: base64,
-        }),
-      });
-      const json = await res.json();
-      console.log(`[Store] save(${session}):`, json.success);
-    } catch (err) {
-      console.error('[Store] save error:', err.message);
-    }
+  console.log(`[Store] save() START for ${session}, data type: ${typeof data}, isBuffer: ${Buffer.isBuffer(data)}`);
+  try {
+    const base64 = Buffer.isBuffer(data) ? data.toString('base64') : Buffer.from(data).toString('base64');
+    console.log(`[Store] base64 length: ${base64.length}`);
+    const res = await fetch(`${this.apiUrl}/v1/whatsapp/session-save`, {
+      method: 'POST',
+      headers: this.headers,
+      body: JSON.stringify({ session_id: session, session_data: base64 }),
+    });
+    console.log(`[Store] HTTP status: ${res.status}`);
+    const json = await res.json();
+    console.log(`[Store] save() response:`, json);
+  } catch (err) {
+    console.error('[Store] save() ERROR:', err.message, err.stack);
   }
+}
 
   async extract({ session, path: destPath }) {
     try {
